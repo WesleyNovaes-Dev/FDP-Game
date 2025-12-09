@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp, Mic, AlertTriangle } from 'lucide-react';
+import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp, Mic, AlertTriangle, Settings } from 'lucide-react';
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, set as firebaseSet, onValue, update, push, child, get, remove, onDisconnect, runTransaction } from "firebase/database";
+import { getDatabase, ref, set as firebaseSet, onValue, update, push, child, get, remove, onDisconnect, runTransaction, query, orderByChild, endAt } from "firebase/database";
 import { getAnalytics } from "firebase/analytics";
 
 // --- FIREBASE CONFIGURATION ---
@@ -61,6 +61,7 @@ type GameState = {
   currentRound: number;
   judgeId: string;
   blackCard: string | null;
+  blackCardRevealed?: boolean; // Controls visibility of black card for non-judges
   phase: GamePhase;
   playedCards: Record<string, PlayedCard>;
   shuffledOrder?: string[]; // Array of card IDs in random order for judging
@@ -69,6 +70,8 @@ type GameState = {
   guessedPlayerId: string | null;
   actualPlayerId: string | null;
   selectedDeckIds?: string[]; // IDs dos decks usados
+  lastActive: number; // Timestamp for cleanup
+  maxHandSize: number; // Configurable hand size
 };
 
 // --- UTILS ---
@@ -261,6 +264,7 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [initializing, setInitializing] = useState(true);
   const [showRules, setShowRules] = useState(false);
+  const [showScoreBoard, setShowScoreBoard] = useState(false);
   
   // Judge Interaction State
   const [confirmWinnerCandidate, setConfirmWinnerCandidate] = useState<PlayedCard | null>(null);
@@ -268,7 +272,48 @@ const App = () => {
   // Ref to track auto-selection
   const hasAutoSelectedDecks = useRef(false);
 
-  // Initial Check
+  // --- CLEANUP LOGIC ---
+  const cleanupInactiveRooms = async () => {
+    try {
+        const inactiveThreshold = Date.now() - (30 * 60 * 1000); // 30 minutes
+        const roomsRef = ref(db, 'rooms');
+        
+        // Use fetching all rooms and filtering client-side to avoid "Index not defined" error
+        // since we cannot programmatically update security rules to add indexes.
+        const snapshot = await get(roomsRef);
+        
+        if (snapshot.exists()) {
+            const updates: Record<string, null> = {};
+            snapshot.forEach((childSnapshot) => {
+                const roomData = childSnapshot.val();
+                // Check if room is inactive based on lastActive timestamp
+                if (roomData.lastActive && roomData.lastActive < inactiveThreshold) {
+                    updates[childSnapshot.key as string] = null;
+                }
+                // Optional: Cleanup rooms with no timestamp if they are very old, but skipping for safety
+            });
+            
+            if (Object.keys(updates).length > 0) {
+                console.log(`Cleaning up ${Object.keys(updates).length} inactive rooms...`);
+                await update(roomsRef, updates);
+            }
+        }
+    } catch (err) {
+        console.error("Cleanup failed:", err);
+    }
+  };
+
+  // Helper to update room activity
+  const touchRoom = async (code: string) => {
+      if (!code) return;
+      // We use update to just change the timestamp without overwriting other data
+      // This is a "fire and forget" operation mostly
+      update(ref(db, `rooms/${code}`), {
+          lastActive: Date.now()
+      }).catch(e => console.error("Error touching room", e));
+  };
+
+  // Initial Check & Cleanup
   useEffect(() => {
     const savedId = localStorage.getItem('fdp_player_id');
     const savedName = localStorage.getItem('fdp_player_name');
@@ -280,7 +325,10 @@ const App = () => {
       });
     }
     
-    // Fetch Decks using onValue (Realtime) instead of get (One-time)
+    // Trigger cleanup on app load
+    cleanupInactiveRooms();
+
+    // Fetch Decks
     const decksRef = ref(db, 'decks');
     const unsubscribeDecks = onValue(decksRef, (snapshot) => {
       if (snapshot.exists()) {
@@ -322,6 +370,20 @@ const App = () => {
         hasAutoSelectedDecks.current = true;
     }
   }, [availableDecks]);
+
+  // Effect to reveal black card after 5 seconds if judge
+  useEffect(() => {
+    if (gameState && gameState.phase === 'SUBMISSION' && user && gameState.judgeId === user.id) {
+       if (!gameState.blackCardRevealed) {
+           const timer = setTimeout(() => {
+               if (gameState.roomCode) {
+                   update(ref(db, `rooms/${gameState.roomCode}`), { blackCardRevealed: true });
+               }
+           }, 5000);
+           return () => clearTimeout(timer);
+       }
+    }
+  }, [gameState?.phase, gameState?.judgeId, gameState?.blackCardRevealed, gameState?.roomCode, user?.id]);
 
   const showNotification = (msg: string) => {
     setNotification(msg);
@@ -455,7 +517,8 @@ const App = () => {
       if (gameState && gameState.phase === 'SUBMISSION' && user) {
           const currentHandSize = hand.length;
           const inboxSize = gameState.players[user.id]?.inbox?.length || 0;
-          const needed = 10 - currentHandSize - inboxSize;
+          const maxHandSize = gameState.maxHandSize || 10;
+          const needed = maxHandSize - currentHandSize - inboxSize;
           
           if (needed > 0) {
               const timer = setTimeout(() => {
@@ -464,7 +527,7 @@ const App = () => {
               return () => clearTimeout(timer);
           }
       }
-  }, [gameState?.phase, hand.length]);
+  }, [gameState?.phase, hand.length, gameState?.maxHandSize]);
 
   // --- DECK EDITOR ACTIONS ---
 
@@ -521,7 +584,7 @@ const App = () => {
              setMinimizeBlack(false);
              setMinimizeWhite(false);
              setEditingDeck({ ...deck });
-          }
+           }
           setShowPasswordPrompt(null);
       } else {
           showNotification("Senha incorreta!");
@@ -579,7 +642,8 @@ const App = () => {
       };
       
       await update(roomRef, {
-        [`players/${user.id}`]: newPlayer
+        [`players/${user.id}`]: newPlayer,
+        lastActive: Date.now() // Update activity
       });
 
       setRoomCode(codeUpper);
@@ -615,7 +679,10 @@ const App = () => {
       roundWinnerId: null,
       guessedPlayerId: null,
       actualPlayerId: null,
-      selectedDeckIds: []
+      selectedDeckIds: [],
+      blackCardRevealed: false,
+      lastActive: Date.now(), // Initialize activity timestamp
+      maxHandSize: 10 // Default hand size
     };
 
     // Using firebaseSet explicitly
@@ -656,7 +723,8 @@ const App = () => {
             blackCards: allBlackCards,
             whiteCards: allWhiteCards
         },
-        selectedDeckIds: idsToLoad
+        selectedDeckIds: idsToLoad,
+        lastActive: Date.now()
     });
     
     setLoading(false);
@@ -687,6 +755,7 @@ const App = () => {
         
         const card = room.gameDeck.blackCards.pop();
         room.blackCard = card;
+        room.blackCardRevealed = false; // Reset reveal state
         
         room.currentRound = (room.currentRound || 0) + 1;
         room.judgeId = nextJudgeId;
@@ -697,6 +766,7 @@ const App = () => {
         room.guessedPlayerId = null;
         room.actualPlayerId = null;
         room.shuffledOrder = null;
+        room.lastActive = Date.now(); // Update timestamp in transaction
         
         return room;
     });
@@ -725,7 +795,9 @@ const App = () => {
       isRevealed: false
     };
 
+    // Parallel updates
     await update(ref(db, `rooms/${roomCode}/playedCards/${cardId}`), playedCard);
+    touchRoom(roomCode);
   };
   
   useEffect(() => {
@@ -741,7 +813,8 @@ const App = () => {
          setTimeout(() => {
             update(ref(db, `rooms/${gameState.roomCode}`), { 
                 phase: 'JUDGING',
-                shuffledOrder: shuffled
+                shuffledOrder: shuffled,
+                lastActive: Date.now()
             });
          }, 1000);
        }
@@ -755,7 +828,8 @@ const App = () => {
     await update(ref(db, `rooms/${roomCode}`), {
       winningCardId: card.id,
       actualPlayerId: card.playerId,
-      phase: 'GUESSING'
+      phase: 'GUESSING',
+      lastActive: Date.now()
     });
   };
 
@@ -764,6 +838,7 @@ const App = () => {
       await update(ref(db, `rooms/${roomCode}/playedCards/${cardId}`), {
           isRevealed: true
       });
+      touchRoom(roomCode);
   };
 
   const judgeGuessPlayer = async (guessedId: string) => {
@@ -793,6 +868,7 @@ const App = () => {
     updates['guessedPlayerId'] = guessedId;
     updates['roundWinnerId'] = gameState.actualPlayerId;
     updates['phase'] = 'RESULT';
+    updates['lastActive'] = Date.now();
 
     await update(ref(db, `rooms/${roomCode}`), updates);
   };
@@ -808,6 +884,13 @@ const App = () => {
       if (newSet.has(deckId)) newSet.delete(deckId);
       else newSet.add(deckId);
       setSelectedDeckIds(newSet);
+  };
+
+  const changeMaxHandSize = (size: number) => {
+      if (!gameState || !user || !gameState.players[user.id].isHost) return;
+      update(ref(db, `rooms/${gameState.roomCode}`), {
+          maxHandSize: size
+      });
   };
 
   // --- RENDERING ---
@@ -1084,8 +1167,8 @@ const App = () => {
                                 </div>
                                 <p className="text-xs text-gray-400 mb-4 line-clamp-2">{deck.description}</p>
                                 <div className="flex gap-4 text-sm text-gray-500 mb-auto">
-                                    <span className="flex items-center gap-1"><Skull size={14}/> {deck.blackCards?.length || 0}</span>
-                                    <span className="flex items-center gap-1"><Smile size={14}/> {deck.whiteCards?.length || 0}</span>
+                                    <span className="flex items-center gap-1"><Skull size={14}/> {deck.blackCards?.length || 0} Pretas</span>
+                                    <span className="flex items-center gap-1"><Smile size={14}/> {deck.whiteCards?.length || 0} Brancas</span>
                                 </div>
                                 <div className="flex gap-2 mt-4 pt-4 border-t border-gray-700">
                                     <Button 
@@ -1189,6 +1272,8 @@ const App = () => {
   if (gameState.phase === 'LOBBY') {
     const playersList = Object.values(gameState.players || {}) as Player[];
     const isHost = gameState.players[user.id]?.isHost;
+    const handSizes = [4, 5, 6, 10, 15];
+    const currentMaxHandSize = gameState.maxHandSize || 10;
     
     return (
       <div className="min-h-screen bg-gray-900 text-white p-4 flex flex-col">
@@ -1197,7 +1282,7 @@ const App = () => {
              <span className="text-xs text-gray-400 uppercase">Sala</span>
              <div className="flex items-center gap-2">
                 <span className="font-mono text-2xl font-bold text-pink-500 tracking-widest">{gameState.roomCode}</span>
-                <button onClick={handleShareRoom} className="text-green-400 hover:text-white flex items-center gap-1 bg-gray-700 px-2 py-1 rounded text-xs ml-2 border border-gray-600">
+                <button onClick={handleShareRoom} className="text-green-400 hover:text-white flex items-center gap-1 bg-gray-700 px-2 py-1 rounded-lg border border-gray-600 ml-2">
                     <Share2 size={12}/> Convidar
                 </button>
              </div>
@@ -1222,9 +1307,29 @@ const App = () => {
           {/* DECK SELECTION (ONLY HOST) */}
           {isHost ? (
              <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 flex-1 overflow-y-auto min-h-[200px]">
+                
+                {/* SETTINGS: HAND SIZE */}
+                <div className="mb-6 border-b border-gray-700 pb-4">
+                    <div className="flex items-center gap-2 mb-2 text-pink-400">
+                        <Settings size={18} />
+                        <h3 className="font-bold uppercase text-sm">Cartas na Mão</h3>
+                    </div>
+                    <div className="flex gap-2">
+                        {handSizes.map(size => (
+                            <button
+                                key={size}
+                                onClick={() => changeMaxHandSize(size)}
+                                className={`flex-1 py-2 rounded-lg font-bold text-sm transition-all border ${currentMaxHandSize === size ? 'bg-pink-500 border-pink-500 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
+                            >
+                                {size}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
                 <div className="flex items-center gap-2 mb-4 text-pink-400">
                     <Database size={18} />
-                    <h3 className="font-bold uppercase text-sm">Configuração de Baralhos</h3>
+                    <h3 className="font-bold uppercase text-sm">Baralhos</h3>
                 </div>
                 {availableDecks.length === 0 ? (
                     <div className="text-gray-500 text-center text-sm py-4 flex flex-col items-center">
@@ -1261,7 +1366,10 @@ const App = () => {
              </div>
           ) : (
              <div className="flex-1 flex flex-col items-center justify-center text-center opacity-50">
-                <p className="text-gray-400">O anfitrião está configurando os baralhos...</p>
+                <p className="text-gray-400">O anfitrião está configurando a partida...</p>
+                <div className="mt-4 text-sm bg-gray-800 px-4 py-2 rounded-full border border-gray-700">
+                    Cartas na mão: <span className="font-bold text-pink-500">{currentMaxHandSize}</span>
+                </div>
              </div>
           )}
 
@@ -1285,7 +1393,6 @@ const App = () => {
   }
 
   // 4. GAME BOARD
-  // (No Changes to game board rendering, just kept it clean for completion if needed)
   const isJudge = gameState.judgeId === user.id;
   const isSubmissionPhase = gameState.phase === 'SUBMISSION';
   const isJudgingPhase = gameState.phase === 'JUDGING';
@@ -1300,17 +1407,71 @@ const App = () => {
   // Check if current user has already played a card in this round
   const hasUserPlayed = isSubmissionPhase && Object.values(gameState.playedCards || {}).some((c: any) => c.playerId === user.id);
 
+  // Scoreboard Logic
+  const sortedPlayers = (Object.values(gameState.players) as Player[]).sort((a, b) => b.score - a.score);
+
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col overflow-hidden">
+      
+      {/* SCOREBOARD MODAL */}
+      {showScoreBoard && (
+        <div className="fixed inset-0 z-50 bg-black/95 flex items-center justify-center p-4 animate-fadeIn" onClick={() => setShowScoreBoard(false)}>
+           <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 w-full max-w-md shadow-2xl relative" onClick={e => e.stopPropagation()}>
+               <button onClick={() => setShowScoreBoard(false)} className="absolute top-4 right-4 text-gray-400 hover:text-white">
+                 <X size={24} />
+               </button>
+               <h2 className="text-xl font-black text-center mb-6 uppercase tracking-widest text-yellow-500 flex items-center justify-center gap-2">
+                   <Trophy size={24}/> Placar Geral
+               </h2>
+               <div className="space-y-3">
+                   {sortedPlayers.map((p, idx) => (
+                       <div key={p.id} className="bg-gray-700/50 p-3 rounded-xl flex items-center justify-between border border-gray-600">
+                           <div className="flex items-center gap-3">
+                               <span className="font-mono text-gray-400 w-6 text-center">#{idx + 1}</span>
+                               <Avatar id={p.avatarId} size="sm"/>
+                               <div className="flex flex-col">
+                                   <span className="font-bold text-sm flex items-center gap-1">
+                                       {p.name}
+                                       {p.id === gameState.judgeId && <Gavel size={12} className="text-yellow-500"/>}
+                                   </span>
+                                   {p.isHost && <span className="text-[10px] text-yellow-500 uppercase">Host</span>}
+                               </div>
+                           </div>
+                           <div className="font-bold text-xl">{p.score}</div>
+                       </div>
+                   ))}
+               </div>
+           </div>
+        </div>
+      )}
+
       {/* HEADER INFO */}
-      <div className="bg-gray-800 p-2 shadow-lg flex justify-between items-center z-20 shrink-0">
-         <div className="flex items-center gap-2">
-            <div className="bg-gray-700 px-3 py-1 rounded-lg text-xs font-mono border border-gray-600">
-               R: {gameState.currentRound}
-            </div>
-            {isJudge && <div className="bg-yellow-500/20 text-yellow-500 px-3 py-1 rounded-lg text-xs font-bold border border-yellow-500/50 flex items-center gap-1"><Gavel size={12}/> JUIZ</div>}
+      <div className="bg-gray-800 p-3 shadow-lg flex justify-between items-center z-20 shrink-0">
+         {/* LEFT: JUDGE INFO */}
+         <div className="flex flex-col">
+             <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wide mb-1">Rodada {gameState.currentRound}</span>
+             <div className="bg-yellow-500/10 text-yellow-500 px-3 py-1 rounded-lg text-sm font-bold border border-yellow-500/30 flex items-center gap-2">
+                 <Gavel size={16}/> 
+                 <span className="truncate max-w-[100px]">{gameState.players[gameState.judgeId]?.name || 'Juiz'}</span>
+             </div>
          </div>
-         <div className="font-bold text-pink-500 tracking-widest text-lg">{gameState.roomCode}</div>
+         
+         {/* CENTER: ROOM CODE */}
+         <div className="font-bold text-gray-600 tracking-widest text-xs flex flex-col items-center">
+             <span>SALA</span>
+             <span className="text-lg text-pink-500">{gameState.roomCode}</span>
+         </div>
+
+         {/* RIGHT: SCORE BUTTON */}
+         <button onClick={() => setShowScoreBoard(true)} className="flex flex-col items-end group">
+             <span className="text-[10px] text-gray-400 uppercase font-bold group-hover:text-white transition-colors">Ver Placar</span>
+             <div className="flex items-center gap-2">
+                 <span className="text-2xl font-black">{gameState.players[user.id].score}</span>
+                 <div className="bg-gray-700 p-2 rounded-full border border-gray-600 group-hover:bg-gray-600 group-hover:border-yellow-500 transition-all">
+                    <Trophy size={16} className="text-yellow-500"/>
+                 </div>
+             </div>
+         </button>
       </div>
 
       {/* GAME AREA */}
@@ -1318,7 +1479,11 @@ const App = () => {
          {/* BLACK CARD */}
          <div className="bg-gray-900 p-4 shrink-0 shadow-xl z-10">
             <div className="max-w-md mx-auto">
-               <Card text={gameState.blackCard || "..."} type="BLACK" />
+               <Card 
+                  text={gameState.blackCard || "..."} 
+                  type="BLACK" 
+                  hidden={!isJudge && !gameState.blackCardRevealed}
+               />
             </div>
          </div>
 
