@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp } from 'lucide-react';
+import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp, Mic, AlertTriangle } from 'lucide-react';
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, set, onValue, update, push, child, get, remove, onDisconnect, runTransaction } from "firebase/database";
+import { getDatabase, ref, set as firebaseSet, onValue, update, push, child, get, remove, onDisconnect, runTransaction } from "firebase/database";
 import { getAnalytics } from "firebase/analytics";
 
 // --- FIREBASE CONFIGURATION ---
@@ -52,6 +52,7 @@ type PlayedCard = {
   playerId: string;
   cardText: string;
   isHidden: boolean;
+  isRevealed?: boolean; // Se true, todos podem ver o texto na fase de julgamento
 };
 
 type GameState = {
@@ -62,6 +63,7 @@ type GameState = {
   blackCard: string | null;
   phase: GamePhase;
   playedCards: Record<string, PlayedCard>;
+  shuffledOrder?: string[]; // Array of card IDs in random order for judging
   winningCardId: string | null;
   roundWinnerId: string | null;
   guessedPlayerId: string | null;
@@ -108,7 +110,7 @@ const Card = ({
       onClick={onClick}
       className={`
         relative flex flex-col justify-between p-3 rounded-xl shadow-xl w-full cursor-pointer transition-all duration-300 select-none
-        ${small ? 'aspect-auto h-24' : 'aspect-[3/4] max-w-[160px]'}
+        ${small ? 'aspect-auto h-32' : 'aspect-[3/4] max-w-[160px]'}
         ${hidden ? 'bg-gray-800 border-2 border-gray-700' : isBlack ? 'bg-black text-white border-2 border-gray-800' : 'bg-white text-black border-2 border-gray-200'}
         ${selected ? 'ring-4 ring-pink-500 transform -translate-y-4 shadow-2xl z-10' : 'hover:scale-105'}
         ${isWinner ? 'ring-4 ring-yellow-400 shadow-yellow-400/50' : ''}
@@ -120,7 +122,7 @@ const Card = ({
         </div>
       ) : (
         <>
-          <div className={`font-bold leading-tight overflow-y-auto scrollbar-hide ${small ? 'text-xs' : 'text-lg'} ${isBlack ? 'text-white' : 'text-gray-900'}`}>
+          <div className={`font-bold leading-tight overflow-y-auto scrollbar-hide ${small ? 'text-sm' : 'text-lg'} ${isBlack ? 'text-white' : 'text-gray-900'}`}>
             {text}
           </div>
           {!small && (
@@ -259,6 +261,9 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [initializing, setInitializing] = useState(true);
   const [showRules, setShowRules] = useState(false);
+  
+  // Judge Interaction State
+  const [confirmWinnerCandidate, setConfirmWinnerCandidate] = useState<PlayedCard | null>(null);
 
   // Ref to track auto-selection
   const hasAutoSelectedDecks = useRef(false);
@@ -411,10 +416,15 @@ const App = () => {
 
   const consumeInbox = async () => {
      if(!gameState || !user) return;
+     // Use gameState.roomCode to be safe
+     const currentRoomCode = gameState.roomCode || roomCode;
+     if (!currentRoomCode) return;
+
      const inbox = gameState.players[user.id]?.inbox || [];
      if (inbox.length > 0) {
          setHand(prev => [...prev, ...inbox]);
-         await set(ref(db, `rooms/${roomCode}/players/${user.id}/inbox`), []);
+         // Using firebaseSet explicitly
+         await firebaseSet(ref(db, `rooms/${currentRoomCode}/players/${user.id}/inbox`), []);
      }
   };
 
@@ -600,7 +610,7 @@ const App = () => {
       judgeId: user.id,
       blackCard: null,
       phase: 'LOBBY',
-      playedCards: {},
+      playedCards: {} as Record<string, PlayedCard>,
       winningCardId: null,
       roundWinnerId: null,
       guessedPlayerId: null,
@@ -608,7 +618,8 @@ const App = () => {
       selectedDeckIds: []
     };
 
-    await set(ref(db, `rooms/${newCode}`), initialState);
+    // Using firebaseSet explicitly
+    await firebaseSet(ref(db, `rooms/${newCode}`), initialState);
     
     setRoomCode(newCode);
     setHand([]);
@@ -655,7 +666,7 @@ const App = () => {
   const startNewRound = async (isFirst = false) => {
     if (!gameState || !roomCode) return;
 
-    const playersList = Object.values(gameState.players || {});
+    const playersList = Object.values(gameState.players || {}) as Player[];
     if (playersList.length < 2) {
       showNotification("Precisa de pelo menos 2 jogadores!");
       return;
@@ -685,6 +696,7 @@ const App = () => {
         room.roundWinnerId = null;
         room.guessedPlayerId = null;
         room.actualPlayerId = null;
+        room.shuffledOrder = null;
         
         return room;
     });
@@ -693,6 +705,13 @@ const App = () => {
   const playCard = async (cardText: string) => {
     if (!user || !gameState || !roomCode) return;
     
+    // Check if player already played this round
+    const hasPlayed = gameState.playedCards && Object.values(gameState.playedCards).some((c: PlayedCard) => c.playerId === user.id);
+    if (hasPlayed) {
+        showNotification("Você já enviou uma carta nesta rodada!");
+        return;
+    }
+
     const newHand = hand.filter(c => c !== cardText);
     setHand(newHand);
     setSelectedCardIndex(null);
@@ -702,7 +721,8 @@ const App = () => {
       id: cardId,
       playerId: user.id,
       cardText: cardText,
-      isHidden: true
+      isHidden: true,
+      isRevealed: false
     };
 
     await update(ref(db, `rooms/${roomCode}/playedCards/${cardId}`), playedCard);
@@ -714,8 +734,15 @@ const App = () => {
        const playedCount = gameState.playedCards ? Object.keys(gameState.playedCards).length : 0;
        
        if (playersCount > 1 && playedCount === playersCount - 1) {
+         // Create shuffled order
+         const cardIds = Object.keys(gameState.playedCards || {});
+         const shuffled = shuffleArray(cardIds);
+         
          setTimeout(() => {
-            update(ref(db, `rooms/${gameState.roomCode}`), { phase: 'JUDGING' });
+            update(ref(db, `rooms/${gameState.roomCode}`), { 
+                phase: 'JUDGING',
+                shuffledOrder: shuffled
+            });
          }, 1000);
        }
     }
@@ -723,11 +750,20 @@ const App = () => {
 
   const judgeSelectWinner = async (card: PlayedCard) => {
     if (!gameState || !roomCode) return;
+    setConfirmWinnerCandidate(null); // Close confirmation modal
+    
     await update(ref(db, `rooms/${roomCode}`), {
       winningCardId: card.id,
       actualPlayerId: card.playerId,
       phase: 'GUESSING'
     });
+  };
+
+  const revealCard = async (cardId: string) => {
+      if (!roomCode) return;
+      await update(ref(db, `rooms/${roomCode}/playedCards/${cardId}`), {
+          isRevealed: true
+      });
   };
 
   const judgeGuessPlayer = async (guessedId: string) => {
@@ -829,7 +865,7 @@ const App = () => {
 
         {/* FOOTER */}
         <div className="w-full text-center pb-2 text-gray-500 text-xs font-mono">
-             Desenvolvido por Kana Sutra - P2
+             Desenvolvido por Kana Sutra - P2 - 1.0.0.0
         </div>
       </div>
     );
@@ -1256,7 +1292,13 @@ const App = () => {
   const isGuessingPhase = gameState.phase === 'GUESSING';
   const isResultPhase = gameState.phase === 'RESULT';
 
-  const playedCardsList = Object.values(gameState.playedCards || {});
+  // Order logic: if shuffledOrder exists (in Judging), use it. Otherwise use normal order.
+  const playedCardsList = (gameState.shuffledOrder 
+     ? gameState.shuffledOrder.map(id => gameState.playedCards[id]).filter(Boolean)
+     : Object.values(gameState.playedCards || {})) as PlayedCard[];
+
+  // Check if current user has already played a card in this round
+  const hasUserPlayed = isSubmissionPhase && Object.values(gameState.playedCards || {}).some((c: any) => c.playerId === user.id);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col overflow-hidden">
@@ -1285,8 +1327,8 @@ const App = () => {
             <div className="max-w-md mx-auto space-y-6 pb-24">
                 {/* INSTRUCTIONS */}
                 <div className="text-center text-gray-400 text-sm animate-pulse">
-                   {isSubmissionPhase && (isJudge ? "Aguarde os jogadores escolherem..." : "Escolha a melhor carta da sua mão!")}
-                   {isJudgingPhase && (isJudge ? "Escolha a carta vencedora!" : "O Juiz está julgando...")}
+                   {isSubmissionPhase && (isJudge ? "Aguarde os jogadores escolherem..." : (hasUserPlayed ? "Aguardando os outros jogadores..." : "Escolha a melhor carta da sua mão!"))}
+                   {isJudgingPhase && (isJudge ? "Toque nas cartas para VIRAR. Escolha a mais engraçada!" : "O Juiz está lendo as cartas...")}
                    {isGuessingPhase && (isJudge ? "Quem jogou essa carta? Adivinhe!" : "O Juiz está tentando adivinhar...")}
                    {isResultPhase && "Resultado da rodada!"}
                 </div>
@@ -1296,7 +1338,7 @@ const App = () => {
                    <div className="grid grid-cols-2 gap-3">
                       {playedCardsList.map((pc) => {
                           const isWinningCard = gameState.winningCardId === pc.id;
-                          const showFace = isResultPhase || (isGuessingPhase && isWinningCard) || isJudgingPhase;
+                          const showFace = isResultPhase || (isGuessingPhase && isWinningCard) || (isJudgingPhase && pc.isRevealed);
                           
                           return (
                             <div key={pc.id} className="flex flex-col items-center">
@@ -1306,7 +1348,13 @@ const App = () => {
                                   hidden={!showFace}
                                   isWinner={isWinningCard}
                                   onClick={() => {
-                                      if(isJudgingPhase && isJudge) judgeSelectWinner(pc);
+                                      if(isJudgingPhase && isJudge) {
+                                          if (!pc.isRevealed) {
+                                              revealCard(pc.id);
+                                          } else {
+                                              setConfirmWinnerCandidate(pc);
+                                          }
+                                      }
                                   }}
                                   small
                                />
@@ -1320,13 +1368,39 @@ const App = () => {
                       })}
                    </div>
                 )}
+
+                {/* CONFIRM WINNER MODAL */}
+                {isJudgingPhase && isJudge && confirmWinnerCandidate && (
+                    <div className="fixed inset-0 z-50 bg-black/95 flex flex-col items-center justify-center p-6 animate-fadeIn">
+                         <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 w-full max-w-sm text-center shadow-2xl">
+                             <div className="mb-4">
+                                <AlertTriangle className="mx-auto text-yellow-500 mb-2" size={32}/>
+                                <h3 className="text-lg font-bold text-white">Confirmar Vencedora?</h3>
+                                <p className="text-sm text-gray-400 mt-2">Você tem certeza que esta é a carta mais engraçada?</p>
+                             </div>
+
+                             <div className="bg-white text-black p-4 rounded-xl font-bold mb-6 text-sm">
+                                 {confirmWinnerCandidate.cardText}
+                             </div>
+
+                             <div className="flex gap-3">
+                                 <Button fullWidth onClick={() => setConfirmWinnerCandidate(null)} variant="secondary">
+                                     Cancelar
+                                 </Button>
+                                 <Button fullWidth onClick={() => judgeSelectWinner(confirmWinnerCandidate)} variant="success">
+                                     <Crown size={16} /> Confirmar
+                                 </Button>
+                             </div>
+                         </div>
+                    </div>
+                )}
                 
                 {/* GUESSING UI */}
                 {isGuessingPhase && isJudge && (
                     <div className="bg-gray-800 p-4 rounded-xl border border-pink-500/50 shadow-2xl animate-fadeIn">
                         <h3 className="font-bold text-center mb-4 text-pink-400">De quem é essa carta?</h3>
                         <div className="grid grid-cols-2 gap-2">
-                            {Object.values(gameState.players).filter(p => p.id !== user.id).map(p => (
+                            {(Object.values(gameState.players) as Player[]).filter(p => p.id !== user.id).map(p => (
                                 <button 
                                    key={p.id}
                                    onClick={() => judgeGuessPlayer(p.id)}
@@ -1371,7 +1445,7 @@ const App = () => {
          </div>
 
          {/* HAND AREA (BOTTOM SHEET) */}
-         {isSubmissionPhase && !isJudge && (
+         {isSubmissionPhase && !isJudge && !hasUserPlayed && (
              <div className="bg-gray-900 border-t border-gray-800 p-4 pb-8 shadow-[0_-10px_40px_rgba(0,0,0,0.5)] z-30">
                  <div className="text-xs text-gray-500 mb-2 uppercase font-bold flex justify-between">
                     <span>Sua Mão</span>
@@ -1397,6 +1471,17 @@ const App = () => {
                      </div>
                  )}
              </div>
+         )}
+         
+         {/* WAITING AREA AFTER PLAYING */}
+         {isSubmissionPhase && !isJudge && hasUserPlayed && (
+            <div className="bg-gray-900 border-t border-gray-800 p-6 text-center z-30 flex flex-col items-center justify-center gap-2">
+                 <div className="bg-gray-800 p-4 rounded-full">
+                    <Smile className="text-green-500 animate-bounce" size={32}/>
+                 </div>
+                 <h3 className="font-bold text-white">Carta Enviada!</h3>
+                 <p className="text-gray-400 text-xs animate-pulse">Aguardando os outros jogadores...</p>
+            </div>
          )}
       </div>
     </div>
