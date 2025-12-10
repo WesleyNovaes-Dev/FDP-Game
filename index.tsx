@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp, Mic, AlertTriangle, Settings } from 'lucide-react';
+import { User, Users, Play, Crown, Trophy, Smile, Skull, Zap, MessageSquare, ArrowRight, Gavel, HelpCircle, LogOut, Copy, Shuffle, Database, Plus, Trash2, Edit, Save, X, Lock, Unlock, Eye, EyeOff, BookOpen, Instagram, Share2, ChevronDown, ChevronUp, Mic, AlertTriangle, Settings, Ban, Clock, Power } from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, set as firebaseSet, onValue, update, push, child, get, remove, onDisconnect, runTransaction, query, orderByChild, endAt } from "firebase/database";
 import { getAnalytics } from "firebase/analytics";
@@ -31,47 +31,67 @@ type Player = {
   score: number;
   avatarId: number;
   isHost: boolean;
-  inbox?: string[];
+  hand?: string[]; // Cards are now stored in DB for persistence
+  afkStrikes?: number;
 };
 
 type Deck = {
-  id: string; // key from firebase
+  id: string; 
   name: string;
   description?: string;
-  password?: string; // Senha para edição/exclusão
+  password?: string;
   isSystem?: boolean;
   blackCards?: string[];
   whiteCards?: string[];
-  selected?: boolean; // UI state only
+  selected?: boolean;
 };
 
-type GamePhase = 'LOBBY' | 'SUBMISSION' | 'JUDGING' | 'GUESSING' | 'RESULT';
+type GamePhase = 'LOBBY' | 'SUBMISSION' | 'JUDGING' | 'GUESSING' | 'RESULT' | 'GAME_OVER';
 
 type PlayedCard = {
   id: string;
   playerId: string;
   cardText: string;
   isHidden: boolean;
-  isRevealed?: boolean; // Se true, todos podem ver o texto na fase de julgamento
+  isRevealed?: boolean;
+};
+
+type GameConfig = {
+    roundTimeout: number; // in seconds
+    winCondition: 'INFINITE' | 'MAX_SCORE' | 'MAX_ROUNDS';
+    winValue: number; // Score or Number of rounds
 };
 
 type GameState = {
   roomCode: string;
+  originalHostId: string;
   players: Record<string, Player>;
   currentRound: number;
   judgeId: string;
   blackCard: string | null;
-  blackCardRevealed?: boolean; // Controls visibility of black card for non-judges
+  blackCardRevealed?: boolean;
   phase: GamePhase;
   playedCards: Record<string, PlayedCard>;
-  shuffledOrder?: string[]; // Array of card IDs in random order for judging
+  shuffledOrder?: string[];
   winningCardId: string | null;
   roundWinnerId: string | null;
   guessedPlayerId: string | null;
   actualPlayerId: string | null;
-  selectedDeckIds?: string[]; // IDs dos decks usados
-  lastActive: number; // Timestamp for cleanup
-  maxHandSize: number; // Configurable hand size
+  selectedDeckIds?: string[];
+  lastActive: number;
+  maxHandSize: number;
+  submissionDeadline?: number | null;
+  config: GameConfig;
+  gameWinnerId?: string | null;
+  
+  gameDeck: {
+      blackCards: string[];
+      whiteCards: string[];
+  };
+  discardPile: {
+      blackCards: string[];
+      whiteCards: string[];
+  };
 };
 
 // --- UTILS ---
@@ -79,7 +99,8 @@ const generateRoomCode = () => Math.random().toString(36).substring(2, 6).toUppe
 const generatePlayerId = () => 'user_' + Math.random().toString(36).substring(2, 9);
 const shuffleArray = (array: any[]) => {
   if (!array) return [];
-  const newArr = [...array];
+  // Filter out undefined or null values to prevent Firebase errors
+  const newArr = array.filter(item => item !== undefined && item !== null);
   for (let i = newArr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [newArr[i], newArr[j]] = [newArr[j], newArr[i]];
@@ -95,7 +116,7 @@ const Card = ({
   selected = false, 
   onClick, 
   hidden = false, 
-  isWinner = false,
+  isWinner = false, 
   small = false
 }: { 
   text: string, 
@@ -239,13 +260,14 @@ const App = () => {
   // Local User State
   const [user, setUser] = useState<{ name: string, id: string, avatarId: number } | null>(null);
   const [roomCode, setRoomCode] = useState("");
-  const [hand, setHand] = useState<string[]>([]);
   const [appMode, setAppMode] = useState<'MENU' | 'DECK_EDITOR'>('MENU');
   
   // Synced Game State
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [availableDecks, setAvailableDecks] = useState<Deck[]>([]);
-  const [selectedDeckIds, setSelectedDeckIds] = useState<Set<string>>(new Set());
+  // selectedDeckIds is now part of GameState, removed local state
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [resultCountdown, setResultCountdown] = useState<number | null>(null);
 
   // Deck Editor State
   const [editingDeck, setEditingDeck] = useState<Partial<Deck> | null>(null);
@@ -279,18 +301,17 @@ const App = () => {
         const roomsRef = ref(db, 'rooms');
         
         // Use fetching all rooms and filtering client-side to avoid "Index not defined" error
-        // since we cannot programmatically update security rules to add indexes.
         const snapshot = await get(roomsRef);
         
         if (snapshot.exists()) {
             const updates: Record<string, null> = {};
             snapshot.forEach((childSnapshot) => {
                 const roomData = childSnapshot.val();
-                // Check if room is inactive based on lastActive timestamp
                 if (roomData.lastActive && roomData.lastActive < inactiveThreshold) {
+                    // This deletes the ROOM. Since Players are children of the Room,
+                    // ALL player data (hand, score, session) linked to this room is automatically deleted.
                     updates[childSnapshot.key as string] = null;
                 }
-                // Optional: Cleanup rooms with no timestamp if they are very old, but skipping for safety
             });
             
             if (Object.keys(updates).length > 0) {
@@ -303,11 +324,8 @@ const App = () => {
     }
   };
 
-  // Helper to update room activity
   const touchRoom = async (code: string) => {
       if (!code) return;
-      // We use update to just change the timestamp without overwriting other data
-      // This is a "fire and forget" operation mostly
       update(ref(db, `rooms/${code}`), {
           lastActive: Date.now()
       }).catch(e => console.error("Error touching room", e));
@@ -315,20 +333,46 @@ const App = () => {
 
   // Initial Check & Cleanup
   useEffect(() => {
-    const savedId = localStorage.getItem('fdp_player_id');
-    const savedName = localStorage.getItem('fdp_player_name');
-    if (savedId && savedName) {
-      setUser({ 
-        id: savedId, 
-        name: savedName, 
-        avatarId: Math.floor(Math.random() * 10) 
-      });
-    }
-    
-    // Trigger cleanup on app load
-    cleanupInactiveRooms();
+    const initializeAppSession = async () => {
+      // 1. Restore User Identity (Local)
+      const savedId = localStorage.getItem('fdp_player_id');
+      const savedName = localStorage.getItem('fdp_player_name');
+      
+      if (savedId && savedName) {
+        setUser({ 
+          id: savedId, 
+          name: savedName, 
+          avatarId: Math.floor(Math.random() * 10) 
+        });
+        
+        // 2. Restore Session (Auto-Reconnect)
+        const savedRoom = localStorage.getItem('fdp_room_code');
+        if (savedRoom) {
+            console.log("Found saved session for room:", savedRoom);
+            // Verify if room still exists in DB
+            try {
+               const roomSnapshot = await get(ref(db, `rooms/${savedRoom}`));
+               if (roomSnapshot.exists()) {
+                   setRoomCode(savedRoom);
+                   // The onValue listener below will pick up the state
+               } else {
+                   console.log("Saved room no longer exists. Clearing session.");
+                   localStorage.removeItem('fdp_room_code');
+                   setRoomCode("");
+               }
+            } catch (e) {
+                console.error("Error verifying session", e);
+            }
+        }
+      }
+      
+      // 3. Run Global Cleanup (Remove dead rooms/users)
+      await cleanupInactiveRooms();
+      setInitializing(false);
+    };
 
-    // Fetch Decks
+    initializeAppSession();
+
     const decksRef = ref(db, 'decks');
     const unsubscribeDecks = onValue(decksRef, (snapshot) => {
       if (snapshot.exists()) {
@@ -343,7 +387,6 @@ const App = () => {
       }
     });
 
-    setInitializing(false);
     return () => unsubscribeDecks();
   }, []);
 
@@ -352,26 +395,79 @@ const App = () => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (user || gameState) {
         e.preventDefault();
-        e.returnValue = ''; // Chrome requires returnValue to be set
+        e.returnValue = ''; 
       }
     };
-
     window.addEventListener('beforeunload', handleBeforeUnload);
-
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-    };
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [user, gameState]);
 
-  // Effect to select the first deck automatically once loaded
+  // AUTO SELECT FIRST DECK (PERSISTED)
   useEffect(() => {
-    if (availableDecks.length > 0 && !hasAutoSelectedDecks.current) {
-        setSelectedDeckIds(new Set([availableDecks[0].id]));
+    if (availableDecks.length > 0 && !hasAutoSelectedDecks.current && gameState && user && gameState.players[user.id]?.isHost) {
+        // Only if DB is empty
+        if (!gameState.selectedDeckIds || gameState.selectedDeckIds.length === 0) {
+             update(ref(db, `rooms/${gameState.roomCode}`), {
+                 selectedDeckIds: [availableDecks[0].id]
+             });
+        }
         hasAutoSelectedDecks.current = true;
     }
-  }, [availableDecks]);
+  }, [availableDecks, gameState, user]);
 
-  // Effect to reveal black card after 5 seconds if judge
+  // --- TIMER EFFECTS ---
+  
+  // Submission Timer
+  useEffect(() => {
+      if (gameState && gameState.phase === 'SUBMISSION' && gameState.submissionDeadline) {
+          const interval = setInterval(() => {
+              const diff = gameState.submissionDeadline! - Date.now();
+              if (diff > 0) {
+                  setTimeLeft(Math.floor(diff / 1000));
+              } else {
+                  setTimeLeft(0);
+                  // Only HOST triggers the timeout logic to avoid race conditions
+                  if (user && gameState.players[user.id]?.isHost) {
+                      handleRoundTimeout();
+                  }
+                  clearInterval(interval);
+              }
+          }, 1000);
+          return () => clearInterval(interval);
+      } else {
+          setTimeLeft(null);
+      }
+  }, [gameState?.phase, gameState?.submissionDeadline, user?.id]);
+
+  // Result Auto-Next Round Timer
+  useEffect(() => {
+    if (gameState && gameState.phase === 'RESULT') {
+        // Visual countdown for everyone
+        let remaining = 5;
+        setResultCountdown(remaining);
+        const countdownInterval = setInterval(() => {
+            remaining -= 1;
+            setResultCountdown(Math.max(0, remaining));
+            if (remaining <= 0) clearInterval(countdownInterval);
+        }, 1000);
+
+        // Logic triggering (Host only)
+        if (user && gameState.players[user.id]?.isHost) {
+            const nextRoundTimer = setTimeout(() => {
+                 startNewRound(false);
+            }, 5000);
+            return () => {
+                clearTimeout(nextRoundTimer);
+                clearInterval(countdownInterval);
+            };
+        }
+        return () => clearInterval(countdownInterval);
+    } else {
+        setResultCountdown(null);
+    }
+  }, [gameState?.phase, user?.id]);
+
+
   useEffect(() => {
     if (gameState && gameState.phase === 'SUBMISSION' && user && gameState.judgeId === user.id) {
        if (!gameState.blackCardRevealed) {
@@ -420,82 +516,53 @@ const App = () => {
 
   // --- GAME LOGIC: DECK MANAGEMENT ---
 
-  // ... (keep existing draw functions) ...
-  const drawCardsFromRoom = async (count: number): Promise<string[]> => {
-    if (!roomCode) return [];
-    
-    const deckRef = ref(db, `rooms/${roomCode}/gameDeck/whiteCards`);
-    let drawnCards: string[] = [];
-    
-    try {
-      await runTransaction(deckRef, (currentDeck) => {
-        if (!currentDeck || !Array.isArray(currentDeck) || currentDeck.length === 0) {
-          return currentDeck; 
-        }
-        
-        const available = currentDeck.length;
-        const toDraw = Math.min(count, available);
-        
-        if (toDraw > 0) {
-           drawnCards = currentDeck.slice(0, toDraw);
-           const newDeck = currentDeck.slice(toDraw); // Resto do deck
-           return newDeck;
-        }
-        return currentDeck;
-      });
-      return drawnCards; 
-    } catch (e) {
-      console.error("Erro ao comprar cartas", e);
-      return [];
-    }
-  };
-
-  const moveCardsToInbox = async (amount: number) => {
+  // Refill Hand directly to Firebase
+  const refillPlayerHand = async (amount: number) => {
       if(!roomCode || !user) return;
       
       const roomRef = ref(db, `rooms/${roomCode}`);
       await runTransaction(roomRef, (room) => {
-          if (!room || !room.gameDeck || !room.gameDeck.whiteCards) return room;
+          if (!room) return room;
           
-          const deck = room.gameDeck.whiteCards;
-          if (deck.length === 0) return room;
+          if (!room.gameDeck) room.gameDeck = { whiteCards: [], blackCards: [] };
+          if (!room.gameDeck.whiteCards) room.gameDeck.whiteCards = [];
           
+          if (!room.discardPile) room.discardPile = { whiteCards: [], blackCards: [] };
+          if (!room.discardPile.whiteCards) room.discardPile.whiteCards = [];
+
+          let deck = room.gameDeck.whiteCards;
+          let discard = room.discardPile.whiteCards;
+
+          // Deck Cycling
+          if (deck.length < amount && discard.length > 0) {
+              const shuffledDiscard = shuffleArray(discard);
+              // CRITICAL FIX: Append shuffled discard to the BEGINNING (bottom) of the deck
+              // Since pop() takes from the end, we want to exhaust the current deck first.
+              deck = [...shuffledDiscard, ...deck];
+              room.discardPile.whiteCards = [];
+          }
+
           const actualAmount = Math.min(amount, deck.length);
           const drawn = [];
           
-          // Tira do topo
+          // Draw cards safely
+          const currentHand = room.players[user.id].hand || [];
+          
           for(let i=0; i<actualAmount; i++) {
-              drawn.push(deck.pop());
+              const card = deck.pop();
+              // Validate to ensure we don't accidentally give a duplicate if sync is off and card is defined
+              if (card && !currentHand.includes(card)) {
+                  drawn.push(card);
+              }
           }
           
-          if (!room.players[user.id].inbox) room.players[user.id].inbox = [];
-          room.players[user.id].inbox = [...room.players[user.id].inbox, ...drawn];
+          // Persistence: Add to player's hand in DB
+          room.players[user.id].hand = [...currentHand, ...drawn];
           
-          room.gameDeck.whiteCards = deck;
+          room.gameDeck.whiteCards = deck; 
           return room;
       });
   };
-
-  const consumeInbox = async () => {
-     if(!gameState || !user) return;
-     // Use gameState.roomCode to be safe
-     const currentRoomCode = gameState.roomCode || roomCode;
-     if (!currentRoomCode) return;
-
-     const inbox = gameState.players[user.id]?.inbox || [];
-     if (inbox.length > 0) {
-         setHand(prev => [...prev, ...inbox]);
-         // Using firebaseSet explicitly
-         await firebaseSet(ref(db, `rooms/${currentRoomCode}/players/${user.id}/inbox`), []);
-     }
-  };
-
-  useEffect(() => {
-     if (gameState && user && gameState.players[user.id]?.inbox?.length > 0) {
-         consumeInbox();
-     }
-  }, [gameState, user]);
-
 
   useEffect(() => {
     if (!roomCode) return;
@@ -504,9 +571,29 @@ const App = () => {
     const unsubscribe = onValue(roomRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
+        // --- KICK CHECK (User removed from players list) ---
+        if (user && !data.players[user.id]) {
+            setGameState(null);
+            setRoomCode("");
+            localStorage.removeItem('fdp_room_code'); // Clear session
+            showNotification("Você foi removido da sala pelo anfitrião.");
+            return;
+        }
+        
+        // --- HOST RECOVERY CHECK ---
+        if (user && data.originalHostId === user.id && data.players[user.id] && !data.players[user.id].isHost) {
+            update(ref(db, `rooms/${roomCode}/players/${user.id}`), { isHost: true });
+        }
+
         setGameState(data);
       } else {
         setGameState(null);
+        if (roomCode) {
+             // Room was likely deleted by cleanup or host
+             localStorage.removeItem('fdp_room_code'); 
+             setRoomCode("");
+             showNotification("A sala foi encerrada.");
+        }
       }
     });
 
@@ -515,110 +602,19 @@ const App = () => {
 
   useEffect(() => {
       if (gameState && gameState.phase === 'SUBMISSION' && user) {
-          const currentHandSize = hand.length;
-          const inboxSize = gameState.players[user.id]?.inbox?.length || 0;
+          const currentHand = gameState.players[user.id]?.hand || [];
+          const currentHandSize = currentHand.length;
           const maxHandSize = gameState.maxHandSize || 10;
-          const needed = maxHandSize - currentHandSize - inboxSize;
+          const needed = maxHandSize - currentHandSize;
           
           if (needed > 0) {
               const timer = setTimeout(() => {
-                 moveCardsToInbox(needed);
+                 refillPlayerHand(needed);
               }, Math.random() * 1000 + 500); 
               return () => clearTimeout(timer);
           }
       }
-  }, [gameState?.phase, hand.length, gameState?.maxHandSize]);
-
-  // --- DECK EDITOR ACTIONS ---
-
-  const handleStartCreateDeck = () => {
-      setNewBlackCardText("");
-      setNewWhiteCardText("");
-      setMinimizeBlack(false);
-      setMinimizeWhite(false);
-      setEditingDeck({
-          name: "",
-          description: "",
-          password: "",
-          blackCards: [],
-          whiteCards: []
-      });
-  };
-
-  const handleCheckPassword = (deckId: string, action: 'EDIT' | 'DELETE') => {
-      const deck = availableDecks.find((d: Deck) => d.id === deckId);
-      if (!deck) return;
-      
-      // Se não tiver senha, permite ação direta
-      if (!deck.password) {
-           if (action === 'DELETE') {
-             remove(ref(db, `decks/${deck.id}`));
-             showNotification("Deck excluído!");
-           } else {
-             setNewBlackCardText("");
-             setNewWhiteCardText("");
-             setMinimizeBlack(false);
-             setMinimizeWhite(false);
-             setEditingDeck({ ...deck });
-           }
-           return;
-      }
-      
-      // Se tiver senha, pede
-      setDeckPasswordInput("");
-      setShowPasswordPrompt({ deckId, action });
-  };
-
-  const submitPassword = () => {
-      if (!showPasswordPrompt) return;
-      
-      const deck = availableDecks.find((d: Deck) => d.id === showPasswordPrompt.deckId);
-      
-      if (deck && deck.password === deckPasswordInput) {
-          if (showPasswordPrompt.action === 'DELETE') {
-             remove(ref(db, `decks/${deck.id}`));
-             showNotification("Deck excluído!");
-          } else {
-             setNewBlackCardText("");
-             setNewWhiteCardText("");
-             setMinimizeBlack(false);
-             setMinimizeWhite(false);
-             setEditingDeck({ ...deck });
-           }
-          setShowPasswordPrompt(null);
-      } else {
-          showNotification("Senha incorreta!");
-      }
-  };
-
-  const handleSaveDeck = async () => {
-      if (!editingDeck) return;
-      if (!editingDeck.name) return showNotification("Nome é obrigatório");
-      // Senha agora é opcional na criação/edição
-      
-      const isNew = !editingDeck.id;
-      const deckData = {
-          name: editingDeck.name,
-          description: editingDeck.description || "",
-          password: editingDeck.password || "", // Salva vazio se não tiver
-          blackCards: editingDeck.blackCards || [],
-          whiteCards: editingDeck.whiteCards || []
-      };
-
-      try {
-          if (isNew) {
-              await push(ref(db, 'decks'), deckData);
-              showNotification("Deck criado com sucesso!");
-          } else {
-              await update(ref(db, `decks/${editingDeck.id}`), deckData);
-              showNotification("Deck atualizado!");
-          }
-          setEditingDeck(null);
-      } catch (e) {
-          console.error(e);
-          showNotification("Erro ao salvar");
-      }
-  };
+  }, [gameState?.phase, gameState?.players?.[user?.id || '']?.hand?.length, gameState?.maxHandSize]);
 
   // --- ACTIONS ---
 
@@ -633,21 +629,32 @@ const App = () => {
     if (snapshot.exists()) {
       const gameData = snapshot.val();
       
-      const newPlayer: Player = {
+      const existingPlayer = gameData.players && gameData.players[user.id];
+      const isOriginalHost = gameData.originalHostId === user.id;
+
+      // Persistence: If reconnecting, preserve existing properties (like hand, score)
+      const playerUpdate: Player = existingPlayer ? {
+          ...existingPlayer,
+          name: user.name, 
+          isHost: isOriginalHost,
+          // Hand is preserved here
+      } : {
         id: user.id,
         name: user.name,
         score: 0,
         avatarId: user.avatarId,
-        isHost: false
+        isHost: isOriginalHost,
+        afkStrikes: 0,
+        hand: []
       };
       
       await update(roomRef, {
-        [`players/${user.id}`]: newPlayer,
-        lastActive: Date.now() // Update activity
+        [`players/${user.id}`]: playerUpdate,
+        lastActive: Date.now()
       });
 
       setRoomCode(codeUpper);
-      setHand([]);
+      localStorage.setItem('fdp_room_code', codeUpper); // Persist Session
     } else {
       showNotification("Sala não encontrada!");
     }
@@ -664,11 +671,14 @@ const App = () => {
       name: user.name,
       score: 0,
       avatarId: user.avatarId,
-      isHost: true
+      isHost: true,
+      afkStrikes: 0,
+      hand: []
     };
 
     const initialState: GameState = {
       roomCode: newCode,
+      originalHostId: user.id, 
       players: { [user.id]: initialPlayer },
       currentRound: 0,
       judgeId: user.id,
@@ -681,22 +691,65 @@ const App = () => {
       actualPlayerId: null,
       selectedDeckIds: [],
       blackCardRevealed: false,
-      lastActive: Date.now(), // Initialize activity timestamp
-      maxHandSize: 10 // Default hand size
+      lastActive: Date.now(), 
+      maxHandSize: 10,
+      gameDeck: { blackCards: [], whiteCards: [] },
+      discardPile: { blackCards: [], whiteCards: [] },
+      config: {
+          roundTimeout: 60,
+          winCondition: 'INFINITE',
+          winValue: 10
+      }
     };
 
-    // Using firebaseSet explicitly
     await firebaseSet(ref(db, `rooms/${newCode}`), initialState);
     
     setRoomCode(newCode);
-    setHand([]);
+    localStorage.setItem('fdp_room_code', newCode); // Persist Session
     setLoading(false);
+  };
+
+  const kickPlayer = async (targetId: string) => {
+      if (!gameState || !user || !gameState.players[user.id].isHost) return;
+      if (targetId === user.id) return; 
+
+      const roomRef = ref(db, `rooms/${gameState.roomCode}`);
+      
+      await runTransaction(roomRef, (room) => {
+          if (!room || !room.players) return room;
+          
+          delete room.players[targetId];
+
+          if (room.phase !== 'LOBBY') {
+              if (room.judgeId === targetId) {
+                  const remainingIds = Object.keys(room.players);
+                  if (remainingIds.length > 0) {
+                      room.judgeId = room.originalHostId && room.players[room.originalHostId] ? room.originalHostId : remainingIds[0];
+                  } else {
+                      room.phase = 'LOBBY';
+                  }
+              }
+              
+              if (room.playedCards) {
+                  Object.keys(room.playedCards).forEach(key => {
+                      if (room.playedCards[key].playerId === targetId) {
+                          delete room.playedCards[key];
+                      }
+                  });
+              }
+          }
+
+          room.lastActive = Date.now();
+          return room;
+      });
+      
+      showNotification("Jogador removido da sala!");
   };
 
   const startGame = async () => {
     if (!gameState || !user || !gameState.players[user.id].isHost) return;
     
-    const idsToLoad = Array.from(selectedDeckIds);
+    const idsToLoad = gameState.selectedDeckIds || [];
     if (idsToLoad.length === 0) {
         showNotification("Selecione pelo menos um baralho!");
         return;
@@ -710,25 +763,138 @@ const App = () => {
     for (const deckId of idsToLoad) {
         const deckData = availableDecks.find((d: Deck) => d.id === deckId);
         if (deckData) {
-            if(deckData.blackCards) allBlackCards = [...allBlackCards, ...deckData.blackCards];
-            if(deckData.whiteCards) allWhiteCards = [...allWhiteCards, ...deckData.whiteCards];
+            // Trim text to avoid duplicates like "Batata" and "Batata "
+            if(deckData.blackCards) allBlackCards = [...allBlackCards, ...deckData.blackCards.filter((c:any) => c).map((t: string) => t.trim())];
+            if(deckData.whiteCards) allWhiteCards = [...allWhiteCards, ...deckData.whiteCards.filter((c:any) => c).map((t: string) => t.trim())];
         }
     }
     
-    allBlackCards = shuffleArray(allBlackCards);
-    allWhiteCards = shuffleArray(allWhiteCards);
+    // DEDUPLICATE CARDS (Ensure unique text)
+    const uniqueBlackCards = [...new Set(allBlackCards)].filter(Boolean);
+    const uniqueWhiteCards = [...new Set(allWhiteCards)].filter(Boolean);
+
+    const shuffledBlack = shuffleArray(uniqueBlackCards);
+    const shuffledWhite = shuffleArray(uniqueWhiteCards);
     
-    await update(ref(db, `rooms/${roomCode}`), {
+    const updates: any = {
         gameDeck: {
-            blackCards: allBlackCards,
-            whiteCards: allWhiteCards
+            blackCards: shuffledBlack,
+            whiteCards: shuffledWhite
+        },
+        discardPile: {
+            blackCards: [],
+            whiteCards: []
         },
         selectedDeckIds: idsToLoad,
-        lastActive: Date.now()
+        lastActive: Date.now(),
+        // Reset scores
+        currentRound: 0,
+        gameWinnerId: null
+    };
+    
+    // CRITICAL: Clear all players' hands to prevent duplicates from previous games
+    Object.keys(gameState.players).forEach(pid => {
+        updates[`players/${pid}/hand`] = [];
+        updates[`players/${pid}/score`] = 0;
     });
+
+    await update(ref(db, `rooms/${roomCode}`), updates);
     
     setLoading(false);
     startNewRound(true);
+  };
+
+  // --- ROUND TIMEOUT & AFK LOGIC ---
+  const handleRoundTimeout = async () => {
+      if (!gameState || !roomCode) return;
+      
+      await runTransaction(ref(db, `rooms/${roomCode}`), (room) => {
+          if (!room || !room.players) return room;
+          
+          const players = room.players;
+          const playedPlayerIds = new Set(
+              room.playedCards ? Object.values(room.playedCards).map((c: any) => c.playerId) : []
+          );
+          
+          // Check AFK
+          const playersToRemove: string[] = [];
+          Object.keys(players).forEach(pid => {
+              if (pid === room.judgeId) return;
+
+              if (!playedPlayerIds.has(pid)) {
+                  players[pid].afkStrikes = (players[pid].afkStrikes || 0) + 1;
+                  if (players[pid].afkStrikes >= 3) {
+                      playersToRemove.push(pid);
+                  }
+              } else {
+                  players[pid].afkStrikes = 0; 
+              }
+          });
+
+          // Kick AFK Players
+          playersToRemove.forEach(pid => {
+              const wasHost = players[pid].isHost;
+              delete players[pid];
+              
+              if (wasHost) {
+                  const remainingIds = Object.keys(players);
+                  if (remainingIds.length > 0) {
+                      players[remainingIds[0]].isHost = true;
+                      room.originalHostId = remainingIds[0];
+                  }
+              }
+          });
+
+          const playedCount = room.playedCards ? Object.keys(room.playedCards).length : 0;
+          
+          if (playedCount > 0) {
+              const cardIds = Object.keys(room.playedCards || {});
+              const shuffled = shuffleArray(cardIds);
+              room.phase = 'JUDGING';
+              room.shuffledOrder = shuffled;
+              room.submissionDeadline = null; 
+          } else {
+              const playersList = Object.values(room.players || []) as any[];
+              if (playersList.length > 0) {
+                  const currentJudgeIdx = playersList.findIndex((p:any) => p.id === room.judgeId);
+                  const nextJudgeIdx = (currentJudgeIdx + 1) % playersList.length;
+                  room.judgeId = playersList[nextJudgeIdx].id;
+              }
+
+               if (room.blackCard) {
+                  if (!room.discardPile) room.discardPile = {};
+                  if (!room.discardPile.blackCards) room.discardPile.blackCards = [];
+                  room.discardPile.blackCards.push(room.blackCard);
+              }
+              
+              if (!room.gameDeck) room.gameDeck = { blackCards: [], whiteCards: [] };
+              if (!room.gameDeck.blackCards) room.gameDeck.blackCards = [];
+              if (room.gameDeck.blackCards.length === 0 && room.discardPile?.blackCards?.length > 0) {
+                  const cleanDiscard = room.discardPile.blackCards.filter((c:any) => c);
+                  room.gameDeck.blackCards = shuffleArray(cleanDiscard);
+                  room.discardPile.blackCards = [];
+              }
+              
+              const nextCard = room.gameDeck.blackCards.length > 0 ? room.gameDeck.blackCards.pop() : null;
+              room.blackCard = nextCard || "Sem cartas pretas!";
+
+              room.currentRound = (room.currentRound || 0) + 1;
+              room.phase = 'SUBMISSION';
+              room.playedCards = {};
+              room.winningCardId = null;
+              room.roundWinnerId = null;
+              room.guessedPlayerId = null;
+              room.actualPlayerId = null;
+              room.shuffledOrder = null;
+              room.blackCardRevealed = false;
+              // Use configured timeout
+              const timeoutSecs = room.config?.roundTimeout || 60;
+              room.submissionDeadline = Date.now() + (timeoutSecs * 1000); 
+          }
+
+          room.lastActive = Date.now();
+          return room;
+      });
   };
 
   const startNewRound = async (isFirst = false) => {
@@ -740,6 +906,39 @@ const App = () => {
       return;
     }
 
+    // CHECK WIN CONDITION
+    if (!isFirst && gameState.config) {
+        let gameOver = false;
+        let winnerId = null;
+        
+        // 1. Max Rounds
+        if (gameState.config.winCondition === 'MAX_ROUNDS') {
+            if (gameState.currentRound >= gameState.config.winValue) {
+                // Determine winner by score
+                const sorted = [...playersList].sort((a,b) => b.score - a.score);
+                winnerId = sorted[0].id;
+                gameOver = true;
+            }
+        }
+        // 2. Max Score
+        else if (gameState.config.winCondition === 'MAX_SCORE') {
+            const winner = playersList.find(p => p.score >= gameState.config.winValue);
+            if (winner) {
+                winnerId = winner.id;
+                gameOver = true;
+            }
+        }
+
+        if (gameOver) {
+            await update(ref(db, `rooms/${roomCode}`), {
+                phase: 'GAME_OVER',
+                gameWinnerId: winnerId,
+                lastActive: Date.now()
+            });
+            return;
+        }
+    }
+
     let nextJudgeId = gameState.judgeId;
 
     if (!isFirst) {
@@ -749,13 +948,38 @@ const App = () => {
     } 
 
     await runTransaction(ref(db, `rooms/${roomCode}`), (room) => {
-        if (!room || !room.gameDeck || !room.gameDeck.blackCards || room.gameDeck.blackCards.length === 0) {
-             return room;
+        if (!room) return room;
+        
+        if (!room.gameDeck) room.gameDeck = { blackCards: [], whiteCards: [] };
+        if (!room.discardPile) room.discardPile = { blackCards: [], whiteCards: [] };
+        if (!room.discardPile.blackCards) room.discardPile.blackCards = [];
+        if (!room.discardPile.whiteCards) room.discardPile.whiteCards = [];
+        if (!room.gameDeck.blackCards) room.gameDeck.blackCards = [];
+
+        if (room.blackCard) {
+            room.discardPile.blackCards.push(room.blackCard);
+        }
+
+        if (room.playedCards) {
+             const usedWhiteCards = Object.values(room.playedCards).map((c: any) => c.cardText);
+             room.discardPile.whiteCards.push(...usedWhiteCards);
+        }
+
+        if (room.gameDeck.blackCards.length === 0) {
+            if (room.discardPile.blackCards.length > 0) {
+                const cleanDiscard = room.discardPile.blackCards.filter((c:any) => c);
+                room.gameDeck.blackCards = shuffleArray(cleanDiscard);
+                room.discardPile.blackCards = [];
+            }
         }
         
-        const card = room.gameDeck.blackCards.pop();
-        room.blackCard = card;
-        room.blackCardRevealed = false; // Reset reveal state
+        let nextCard = null;
+        if (room.gameDeck.blackCards.length > 0) {
+            nextCard = room.gameDeck.blackCards.pop();
+        }
+
+        room.blackCard = nextCard || null;
+        room.blackCardRevealed = false; 
         
         room.currentRound = (room.currentRound || 0) + 1;
         room.judgeId = nextJudgeId;
@@ -766,7 +990,10 @@ const App = () => {
         room.guessedPlayerId = null;
         room.actualPlayerId = null;
         room.shuffledOrder = null;
-        room.lastActive = Date.now(); // Update timestamp in transaction
+        room.lastActive = Date.now(); 
+        
+        const timeoutSecs = room.config?.roundTimeout || 60;
+        room.submissionDeadline = Date.now() + (timeoutSecs * 1000);
         
         return room;
     });
@@ -775,29 +1002,40 @@ const App = () => {
   const playCard = async (cardText: string) => {
     if (!user || !gameState || !roomCode) return;
     
-    // Check if player already played this round
     const hasPlayed = gameState.playedCards && Object.values(gameState.playedCards).some((c: PlayedCard) => c.playerId === user.id);
     if (hasPlayed) {
         showNotification("Você já enviou uma carta nesta rodada!");
         return;
     }
 
-    const newHand = hand.filter(c => c !== cardText);
-    setHand(newHand);
+    // UPDATE: Remove card from DB using transaction to avoid race conditions
+    await runTransaction(ref(db, `rooms/${roomCode}`), (room) => {
+        if (!room || !room.players || !room.players[user.id]) return room;
+        
+        // Remove from hand
+        const hand = room.players[user.id].hand || [];
+        const cardIndex = hand.indexOf(cardText);
+        if (cardIndex > -1) {
+            hand.splice(cardIndex, 1);
+            room.players[user.id].hand = hand;
+        }
+
+        // Add to played cards
+        if (!room.playedCards) room.playedCards = {};
+        const cardId = `card_${Date.now()}_${Math.random().toString(36).substr(2,5)}`;
+        room.playedCards[cardId] = {
+            id: cardId,
+            playerId: user.id,
+            cardText: cardText,
+            isHidden: true,
+            isRevealed: false
+        };
+
+        room.lastActive = Date.now();
+        return room;
+    });
+
     setSelectedCardIndex(null);
-
-    const cardId = `card_${Date.now()}_${Math.random().toString(36).substr(2,5)}`;
-    const playedCard: PlayedCard = {
-      id: cardId,
-      playerId: user.id,
-      cardText: cardText,
-      isHidden: true,
-      isRevealed: false
-    };
-
-    // Parallel updates
-    await update(ref(db, `rooms/${roomCode}/playedCards/${cardId}`), playedCard);
-    touchRoom(roomCode);
   };
   
   useEffect(() => {
@@ -806,7 +1044,6 @@ const App = () => {
        const playedCount = gameState.playedCards ? Object.keys(gameState.playedCards).length : 0;
        
        if (playersCount > 1 && playedCount === playersCount - 1) {
-         // Create shuffled order
          const cardIds = Object.keys(gameState.playedCards || {});
          const shuffled = shuffleArray(cardIds);
          
@@ -814,7 +1051,8 @@ const App = () => {
             update(ref(db, `rooms/${gameState.roomCode}`), { 
                 phase: 'JUDGING',
                 shuffledOrder: shuffled,
-                lastActive: Date.now()
+                lastActive: Date.now(),
+                submissionDeadline: null 
             });
          }, 1000);
        }
@@ -823,7 +1061,7 @@ const App = () => {
 
   const judgeSelectWinner = async (card: PlayedCard) => {
     if (!gameState || !roomCode) return;
-    setConfirmWinnerCandidate(null); // Close confirmation modal
+    setConfirmWinnerCandidate(null);
     
     await update(ref(db, `rooms/${roomCode}`), {
       winningCardId: card.id,
@@ -873,17 +1111,82 @@ const App = () => {
     await update(ref(db, `rooms/${roomCode}`), updates);
   };
 
-  const leaveRoom = () => {
+  const leaveRoom = async () => {
+     if (!gameState || !user || !roomCode) return;
+
+     // Remove self from DB
+     const roomRef = ref(db, `rooms/${roomCode}`);
+     await runTransaction(roomRef, (room) => {
+        if (!room || !room.players) return room;
+        
+        delete room.players[user.id];
+        
+        // Pass Host Logic
+        if (room.originalHostId === user.id) {
+             const remainingIds = Object.keys(room.players);
+             if (remainingIds.length > 0) {
+                 room.players[remainingIds[0]].isHost = true;
+                 room.originalHostId = remainingIds[0];
+                 // Also ensure judge is valid
+                 if (room.judgeId === user.id) {
+                     room.judgeId = remainingIds[0];
+                 }
+             } else {
+                 // Empty room, might be cleaned up later or we can return null to delete
+                 // returning null here deletes the room immediately
+                 return null;
+             }
+        } else {
+             // If judge left
+             if (room.judgeId === user.id) {
+                 const remainingIds = Object.keys(room.players);
+                 if (remainingIds.length > 0) {
+                     room.judgeId = room.originalHostId && room.players[room.originalHostId] ? room.originalHostId : remainingIds[0];
+                 }
+             }
+        }
+        
+        return room;
+     });
+
+     localStorage.removeItem('fdp_room_code');
      setRoomCode("");
      setGameState(null);
-     setHand([]);
+  };
+
+  const destroyRoom = async () => {
+      if (!roomCode || !user || !gameState?.players[user.id]?.isHost) return;
+      
+      if(confirm("Tem certeza? Isso encerrará o jogo para todos.")) {
+          await remove(ref(db, `rooms/${roomCode}`));
+          localStorage.removeItem('fdp_room_code');
+          setRoomCode("");
+          setGameState(null);
+      }
   };
 
   const toggleDeck = (deckId: string) => {
-      const newSet = new Set(selectedDeckIds);
-      if (newSet.has(deckId)) newSet.delete(deckId);
-      else newSet.add(deckId);
-      setSelectedDeckIds(newSet);
+      if (!gameState || !user || !gameState.players[user.id].isHost) return;
+
+      const currentIds = gameState.selectedDeckIds || [];
+      let newIds: string[];
+      
+      if (currentIds.includes(deckId)) {
+          newIds = currentIds.filter(id => id !== deckId);
+      } else {
+          newIds = [...currentIds, deckId];
+      }
+      
+      update(ref(db, `rooms/${gameState.roomCode}`), {
+          selectedDeckIds: newIds
+      });
+  };
+
+  const updateConfig = (key: keyof GameConfig, value: any) => {
+      if (!gameState || !user || !gameState.players[user.id].isHost) return;
+      update(ref(db, `rooms/${gameState.roomCode}/config`), {
+          [key]: value
+      });
   };
 
   const changeMaxHandSize = (size: number) => {
@@ -891,6 +1194,95 @@ const App = () => {
       update(ref(db, `rooms/${gameState.roomCode}`), {
           maxHandSize: size
       });
+  };
+
+  // --- DECK EDITOR FUNCTIONS ---
+  
+  const handleStartCreateDeck = () => {
+      setEditingDeck({ name: "", description: "", blackCards: [], whiteCards: [] });
+  };
+
+  const handleCheckPassword = (deckId: string, action: 'EDIT' | 'DELETE') => {
+      const deck = availableDecks.find(d => d.id === deckId);
+      if (!deck) return;
+
+      if (deck.password && deck.password.trim() !== "") {
+          setShowPasswordPrompt({ deckId, action });
+          setDeckPasswordInput("");
+      } else {
+          if (action === 'EDIT') {
+              setEditingDeck({ ...deck });
+          } else {
+              if (window.confirm("Tem certeza que deseja excluir este baralho?")) {
+                  const deckRef = ref(db, `decks/${deckId}`);
+                  remove(deckRef).then(() => {
+                      showNotification("Baralho excluído!");
+                  }).catch((err: any) => {
+                      console.error(err);
+                      showNotification("Erro ao excluir.");
+                  });
+              }
+          }
+      }
+  };
+
+  const submitPassword = () => {
+      if (!showPasswordPrompt) return;
+      const { deckId, action } = showPasswordPrompt;
+      const deck = availableDecks.find(d => d.id === deckId);
+      
+      if (!deck) {
+          setShowPasswordPrompt(null);
+          return;
+      }
+
+      if (deck.password === deckPasswordInput) {
+           if (action === 'EDIT') {
+              setEditingDeck({ ...deck });
+          } else {
+              const deckRef = ref(db, `decks/${deckId}`);
+              remove(deckRef).then(() => {
+                  showNotification("Baralho excluído!");
+              }).catch((err: any) => {
+                   console.error(err);
+                   showNotification("Erro ao excluir.");
+              });
+          }
+          setShowPasswordPrompt(null);
+          setDeckPasswordInput("");
+      } else {
+          showNotification("Senha incorreta!");
+      }
+  };
+
+  const handleSaveDeck = async () => {
+      if (!editingDeck || !editingDeck.name) {
+          showNotification("Nome é obrigatório!");
+          return;
+      }
+
+      const deckId = editingDeck.id || `deck_${Date.now()}`;
+      const deckRef = ref(db, `decks/${deckId}`);
+      
+      const deckData: any = {
+          name: editingDeck.name,
+          description: editingDeck.description || "",
+          blackCards: editingDeck.blackCards || [],
+          whiteCards: editingDeck.whiteCards || [],
+          lastUpdated: Date.now()
+      };
+      
+      if (editingDeck.password) deckData.password = editingDeck.password;
+      if (editingDeck.isSystem) deckData.isSystem = editingDeck.isSystem;
+
+      try {
+          await firebaseSet(deckRef, deckData);
+          setEditingDeck(null);
+          showNotification("Baralho salvo com sucesso!");
+      } catch (err) {
+          console.error(err);
+          showNotification("Erro ao salvar.");
+      }
   };
 
   // --- RENDERING ---
@@ -907,7 +1299,7 @@ const App = () => {
             </a>
         </div>
 
-        <div className="w-full max-w-md space-y-6 text-center mx-auto my-6 flex flex-col justify-center flex-1">
+        <div className="w-full max-w-md space-y-6 text-center mx-auto my-auto flex flex-col justify-center">
           <div className="flex flex-col items-center justify-center mb-2">
             <div className="relative">
                <div className="absolute inset-0 bg-pink-500 blur-xl opacity-50 rounded-full"></div>
@@ -922,7 +1314,7 @@ const App = () => {
             </h1>
           </div>
           
-          <div className="bg-gray-800 p-6 rounded-2xl shadow-2xl border border-gray-700 w-full">
+          <div className="bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-2xl border border-gray-700 w-full">
             <h2 className="text-xl font-bold mb-6">Quem é você na fila do pão?</h2>
             <div className="space-y-4">
               <input 
@@ -936,12 +1328,14 @@ const App = () => {
                   }
                 }}
               />
-              <Button fullWidth onClick={() => {
-                   const input = document.getElementById('nameInput') as HTMLInputElement;
-                   handleLogin(input.value);
-              }} variant="primary">
-                  ENTRAR
-              </Button>
+              <div className="w-full">
+                <Button fullWidth onClick={() => {
+                    const input = document.getElementById('nameInput') as HTMLInputElement;
+                    handleLogin(input.value);
+                }} variant="primary">
+                    ENTRAR
+                </Button>
+              </div>
             </div>
           </div>
         </div>
@@ -1016,7 +1410,7 @@ const App = () => {
                                         value={editingDeck.password} 
                                         onChange={e => setEditingDeck({...editingDeck, password: e.target.value})}
                                         placeholder="Deixe em branco para público"
-                                        type="text" // Show clear for creator
+                                        type="text" 
                                     />
                                 </div>
                             </div>
@@ -1199,7 +1593,6 @@ const App = () => {
     // --- NORMAL MENU ---
     return (
        <div className="min-h-screen bg-gray-900 text-white p-6 flex flex-col items-center">
-         {/* RULES MODAL */}
          {showRules && <RulesModal onClose={() => setShowRules(false)} />}
          
          <div className="w-full max-w-md space-y-6">
@@ -1236,19 +1629,19 @@ const App = () => {
                     </div>
                   </div>
 
-                 <div className="flex gap-2">
+                 <div className="flex flex-col gap-3">
                     <input 
                        id="roomInput"
                        type="text" 
-                       placeholder="CÓDIGO" 
+                       placeholder="CÓDIGO DA SALA" 
                        maxLength={4}
-                       className="flex-1 bg-gray-900 border border-gray-600 rounded-xl px-4 py-3 text-center uppercase font-mono tracking-widest focus:ring-2 focus:ring-pink-500 outline-none"
+                       className="w-full bg-gray-900 border border-gray-600 rounded-xl px-4 py-3 text-center uppercase font-mono tracking-widest focus:ring-2 focus:ring-pink-500 outline-none text-lg"
                     />
-                    <Button onClick={() => {
+                    <Button fullWidth onClick={() => {
                        const input = document.getElementById('roomInput') as HTMLInputElement;
                        joinGame(input.value);
                     }} disabled={loading} variant="secondary">
-                       ENTRAR
+                       ENTRAR NA SALA
                     </Button>
                  </div>
               </div>
@@ -1274,6 +1667,7 @@ const App = () => {
     const isHost = gameState.players[user.id]?.isHost;
     const handSizes = [4, 5, 6, 10, 15];
     const currentMaxHandSize = gameState.maxHandSize || 10;
+    const currentSelectedDecks = gameState.selectedDeckIds || [];
     
     return (
       <div className="min-h-screen bg-gray-900 text-white p-4 flex flex-col">
@@ -1287,19 +1681,39 @@ const App = () => {
                 </button>
              </div>
           </div>
-          <Button variant="secondary" onClick={leaveRoom} className="px-3 py-2 text-xs"><LogOut size={16}/></Button>
+          <div className="flex gap-2">
+            {isHost ? (
+               <Button variant="danger" onClick={destroyRoom} className="px-3 py-2 text-xs font-bold bg-red-900/50 border border-red-500 hover:bg-red-800">
+                   <Skull size={16} className="mr-1"/> Encerrar Sala
+               </Button>
+            ) : (
+               <Button variant="secondary" onClick={leaveRoom} className="px-3 py-2 text-xs"><LogOut size={16}/> Sair</Button>
+            )}
+          </div>
         </header>
 
         <div className="max-w-md mx-auto w-full space-y-6 flex-1 flex flex-col">
           {/* PLAYER LIST */}
           <div className="grid grid-cols-2 gap-4">
             {playersList.map((p) => (
-              <div key={p.id} className="bg-gray-800 p-3 rounded-xl flex items-center gap-3 border border-gray-700 relative overflow-hidden">
-                <Avatar id={p.avatarId} />
-                <div className="flex flex-col z-10 min-w-0">
-                  <span className="font-bold truncate text-sm">{p.name}</span>
-                  {p.isHost && <span className="text-[10px] text-yellow-500 flex items-center gap-1 uppercase font-bold"><Crown size={10}/> Host</span>}
+              <div key={p.id} className="bg-gray-800 p-3 rounded-xl flex items-center justify-between gap-2 border border-gray-700 relative overflow-hidden group">
+                <div className="flex items-center gap-2 min-w-0">
+                    <Avatar id={p.avatarId} />
+                    <div className="flex flex-col z-10 min-w-0">
+                    <span className="font-bold truncate text-sm">{p.name}</span>
+                    {p.isHost && <span className="text-[10px] text-yellow-500 flex items-center gap-1 uppercase font-bold"><Crown size={10}/> Host</span>}
+                    </div>
                 </div>
+                {/* KICK BUTTON */}
+                {isHost && p.id !== user.id && (
+                    <button 
+                        onClick={() => kickPlayer(p.id)}
+                        className="bg-red-500/20 p-2 rounded hover:bg-red-500 hover:text-white text-red-500 transition-colors"
+                        title="Remover Jogador"
+                    >
+                        <Trash2 size={16} />
+                    </button>
+                )}
               </div>
             ))}
           </div>
@@ -1308,22 +1722,62 @@ const App = () => {
           {isHost ? (
              <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 flex-1 overflow-y-auto min-h-[200px]">
                 
-                {/* SETTINGS: HAND SIZE */}
-                <div className="mb-6 border-b border-gray-700 pb-4">
-                    <div className="flex items-center gap-2 mb-2 text-pink-400">
+                {/* SETTINGS */}
+                <div className="mb-6 border-b border-gray-700 pb-4 space-y-4">
+                    <div className="flex items-center gap-2 text-pink-400">
                         <Settings size={18} />
-                        <h3 className="font-bold uppercase text-sm">Cartas na Mão</h3>
+                        <h3 className="font-bold uppercase text-sm">Configurações</h3>
                     </div>
-                    <div className="flex gap-2">
-                        {handSizes.map(size => (
-                            <button
-                                key={size}
-                                onClick={() => changeMaxHandSize(size)}
-                                className={`flex-1 py-2 rounded-lg font-bold text-sm transition-all border ${currentMaxHandSize === size ? 'bg-pink-500 border-pink-500 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
-                            >
-                                {size}
-                            </button>
-                        ))}
+
+                    {/* Hand Size */}
+                    <div>
+                        <label className="text-xs text-gray-500 uppercase font-bold mb-1 block">Cartas na Mão</label>
+                        <div className="flex gap-2">
+                            {handSizes.map(size => (
+                                <button
+                                    key={size}
+                                    onClick={() => changeMaxHandSize(size)}
+                                    className={`flex-1 py-1 rounded-lg font-bold text-xs transition-all border ${currentMaxHandSize === size ? 'bg-pink-500 border-pink-500 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
+                                >
+                                    {size}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Timer */}
+                    <div>
+                        <label className="text-xs text-gray-500 uppercase font-bold mb-1 block">Tempo de Rodada</label>
+                        <div className="flex gap-2">
+                            {[30, 60, 90, 120].map(time => (
+                                <button
+                                    key={time}
+                                    onClick={() => updateConfig('roundTimeout', time)}
+                                    className={`flex-1 py-1 rounded-lg font-bold text-xs transition-all border ${gameState.config?.roundTimeout === time ? 'bg-pink-500 border-pink-500 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
+                                >
+                                    {time}s
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Win Condition */}
+                    <div>
+                         <label className="text-xs text-gray-500 uppercase font-bold mb-1 block">Fim de Jogo</label>
+                         <div className="grid grid-cols-3 gap-2 mb-2">
+                             <button onClick={() => updateConfig('winCondition', 'INFINITE')} className={`py-1 text-xs border rounded ${gameState.config?.winCondition === 'INFINITE' ? 'bg-blue-600 border-blue-600' : 'border-gray-600'}`}>Infinito</button>
+                             <button onClick={() => updateConfig('winCondition', 'MAX_SCORE')} className={`py-1 text-xs border rounded ${gameState.config?.winCondition === 'MAX_SCORE' ? 'bg-blue-600 border-blue-600' : 'border-gray-600'}`}>Pontos</button>
+                             <button onClick={() => updateConfig('winCondition', 'MAX_ROUNDS')} className={`py-1 text-xs border rounded ${gameState.config?.winCondition === 'MAX_ROUNDS' ? 'bg-blue-600 border-blue-600' : 'border-gray-600'}`}>Rodadas</button>
+                         </div>
+                         {gameState.config?.winCondition !== 'INFINITE' && (
+                             <input 
+                                type="number" 
+                                className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-sm"
+                                value={gameState.config?.winValue || 0}
+                                onChange={(e) => updateConfig('winValue', parseInt(e.target.value))}
+                                placeholder={gameState.config?.winCondition === 'MAX_SCORE' ? "Pontuação Máxima (ex: 50)" : "Número de Rodadas (ex: 10)"}
+                             />
+                         )}
                     </div>
                 </div>
 
@@ -1340,7 +1794,7 @@ const App = () => {
                 ) : (
                     <div className="space-y-3">
                         {availableDecks.map(deck => {
-                            const isSelected = selectedDeckIds.has(deck.id);
+                            const isSelected = currentSelectedDecks.includes(deck.id);
                             return (
                                 <div 
                                   key={deck.id} 
@@ -1365,17 +1819,21 @@ const App = () => {
                 )}
              </div>
           ) : (
-             <div className="flex-1 flex flex-col items-center justify-center text-center opacity-50">
+             <div className="flex-1 flex flex-col items-center justify-center text-center opacity-50 space-y-2">
                 <p className="text-gray-400">O anfitrião está configurando a partida...</p>
-                <div className="mt-4 text-sm bg-gray-800 px-4 py-2 rounded-full border border-gray-700">
-                    Cartas na mão: <span className="font-bold text-pink-500">{currentMaxHandSize}</span>
+                <div className="flex flex-wrap gap-2 justify-center">
+                    <span className="text-xs bg-gray-800 px-2 py-1 rounded border border-gray-700">Mão: {currentMaxHandSize}</span>
+                    <span className="text-xs bg-gray-800 px-2 py-1 rounded border border-gray-700">Tempo: {gameState.config?.roundTimeout}s</span>
+                    <span className="text-xs bg-gray-800 px-2 py-1 rounded border border-gray-700">
+                        {gameState.config?.winCondition === 'INFINITE' ? 'Infinito' : `${gameState.config?.winCondition === 'MAX_SCORE' ? 'Max Pontos' : 'Max Rodadas'}: ${gameState.config?.winValue}`}
+                    </span>
                 </div>
              </div>
           )}
 
           <div className="pt-2 pb-6 sticky bottom-0 bg-gray-900">
             {isHost ? (
-              <Button fullWidth onClick={startGame} variant="success" disabled={playersList.length < 2 || selectedDeckIds.size === 0 || loading}>
+              <Button fullWidth onClick={startGame} variant="success" disabled={playersList.length < 2 || currentSelectedDecks.length === 0 || loading}>
                 <div className="flex items-center gap-2">
                   {loading ? 'Carregando...' : <><Play size={20} /> INICIAR JOGO</>}
                 </div>
@@ -1392,23 +1850,55 @@ const App = () => {
     );
   }
 
-  // 4. GAME BOARD
+  // 4. GAME OVER SCREEN
+  if (gameState.phase === 'GAME_OVER') {
+      const winner = gameState.gameWinnerId ? gameState.players[gameState.gameWinnerId] : null;
+      return (
+          <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-6 text-center">
+              <div className="bg-gray-800 p-8 rounded-2xl border-2 border-yellow-500 shadow-2xl max-w-md w-full relative overflow-hidden">
+                  <div className="absolute inset-0 bg-yellow-500/10 animate-pulse"></div>
+                  <Crown size={64} className="mx-auto text-yellow-500 mb-6 relative z-10 drop-shadow-lg"/>
+                  <h1 className="text-4xl font-black text-white mb-2 relative z-10">FIM DE JOGO!</h1>
+                  
+                  {winner ? (
+                      <div className="my-8 relative z-10">
+                          <div className="mx-auto w-24 h-24 mb-4 relative">
+                              <Avatar id={winner.avatarId} size="lg"/>
+                              <div className="absolute -bottom-2 -right-2 bg-yellow-500 text-black font-bold px-2 rounded-full border border-white">1º</div>
+                          </div>
+                          <h2 className="text-2xl font-bold">{winner.name}</h2>
+                          <p className="text-yellow-500 font-mono text-xl">{winner.score} Pontos</p>
+                      </div>
+                  ) : (
+                      <p className="text-gray-400 my-8">Empate ou jogo encerrado.</p>
+                  )}
+
+                  <div className="space-y-3 relative z-10">
+                    {gameState.players[user.id]?.isHost && (
+                         <Button fullWidth onClick={() => startNewRound(false)} variant="success">Nova Partida</Button>
+                    )}
+                    <Button fullWidth onClick={leaveRoom} variant="secondary">Voltar ao Menu</Button>
+                  </div>
+              </div>
+          </div>
+      )
+  }
+
+  // 5. GAME BOARD
   const isJudge = gameState.judgeId === user.id;
   const isSubmissionPhase = gameState.phase === 'SUBMISSION';
   const isJudgingPhase = gameState.phase === 'JUDGING';
   const isGuessingPhase = gameState.phase === 'GUESSING';
   const isResultPhase = gameState.phase === 'RESULT';
 
-  // Order logic: if shuffledOrder exists (in Judging), use it. Otherwise use normal order.
   const playedCardsList = (gameState.shuffledOrder 
      ? gameState.shuffledOrder.map(id => gameState.playedCards[id]).filter(Boolean)
      : Object.values(gameState.playedCards || {})) as PlayedCard[];
 
-  // Check if current user has already played a card in this round
   const hasUserPlayed = isSubmissionPhase && Object.values(gameState.playedCards || {}).some((c: any) => c.playerId === user.id);
-
-  // Scoreboard Logic
   const sortedPlayers = (Object.values(gameState.players) as Player[]).sort((a, b) => b.score - a.score);
+  const isHost = gameState.players[user.id]?.isHost;
+  const hand = gameState.players[user.id]?.hand || []; // Get hand from DB state
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col overflow-hidden">
@@ -1437,7 +1927,18 @@ const App = () => {
                                    {p.isHost && <span className="text-[10px] text-yellow-500 uppercase">Host</span>}
                                </div>
                            </div>
-                           <div className="font-bold text-xl">{p.score}</div>
+                           <div className="flex items-center gap-2">
+                                <div className="font-bold text-xl">{p.score}</div>
+                                {isHost && p.id !== user.id && (
+                                    <button 
+                                        onClick={() => kickPlayer(p.id)}
+                                        className="text-gray-500 hover:text-red-500 p-1"
+                                        title="Remover"
+                                    >
+                                        <Trash2 size={16}/>
+                                    </button>
+                                )}
+                           </div>
                        </div>
                    ))}
                </div>
@@ -1447,22 +1948,34 @@ const App = () => {
 
       {/* HEADER INFO */}
       <div className="bg-gray-800 p-3 shadow-lg flex justify-between items-center z-20 shrink-0">
-         {/* LEFT: JUDGE INFO */}
-         <div className="flex flex-col">
-             <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wide mb-1">Rodada {gameState.currentRound}</span>
-             <div className="bg-yellow-500/10 text-yellow-500 px-3 py-1 rounded-lg text-sm font-bold border border-yellow-500/30 flex items-center gap-2">
-                 <Gavel size={16}/> 
-                 <span className="truncate max-w-[100px]">{gameState.players[gameState.judgeId]?.name || 'Juiz'}</span>
+         <div className="flex items-center gap-2">
+             <button onClick={leaveRoom} className="bg-red-500/10 p-2 rounded-lg text-red-500 hover:bg-red-500 hover:text-white transition-colors">
+                 <LogOut size={16} />
+             </button>
+             <div className="flex flex-col">
+                 <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wide mb-1">Rodada {gameState.currentRound}</span>
+                 <div className="bg-yellow-500/10 text-yellow-500 px-3 py-1 rounded-lg text-sm font-bold border border-yellow-500/30 flex items-center gap-2">
+                     <Gavel size={16}/> 
+                     <span className="truncate max-w-[100px]">{gameState.players[gameState.judgeId]?.name || 'Juiz'}</span>
+                 </div>
              </div>
          </div>
-         
-         {/* CENTER: ROOM CODE */}
-         <div className="font-bold text-gray-600 tracking-widest text-xs flex flex-col items-center">
-             <span>SALA</span>
-             <span className="text-lg text-pink-500">{gameState.roomCode}</span>
-         </div>
 
-         {/* RIGHT: SCORE BUTTON */}
+         {/* TIMER */}
+         {timeLeft !== null && (
+             <div className={`flex items-center gap-2 font-mono text-xl font-bold ${timeLeft < 10 ? 'text-red-500 animate-pulse' : 'text-gray-300'}`}>
+                 <Clock size={20}/>
+                 {Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, '0')}
+             </div>
+         )}
+         
+         {!timeLeft && gameState.roomCode && (
+             <div className="font-bold text-gray-600 tracking-widest text-xs flex flex-col items-center">
+                 <span>SALA</span>
+                 <span className="text-lg text-pink-500">{gameState.roomCode}</span>
+             </div>
+         )}
+
          <button onClick={() => setShowScoreBoard(true)} className="flex flex-col items-end group">
              <span className="text-[10px] text-gray-400 uppercase font-bold group-hover:text-white transition-colors">Ver Placar</span>
              <div className="flex items-center gap-2">
@@ -1585,9 +2098,23 @@ const App = () => {
                         <Trophy size={48} className="mx-auto text-yellow-500 mb-4" />
                         <h2 className="text-2xl font-black text-white mb-2">Vencedor da Rodada!</h2>
                         
-                        <div className="flex items-center justify-center gap-3 mb-4">
+                        {/* WRONG GUESS DISPLAY */}
+                        {gameState.guessedPlayerId && gameState.guessedPlayerId !== gameState.actualPlayerId && (
+                             <div className="mb-4 bg-red-900/30 p-3 rounded-lg border border-red-500/50">
+                                 <p className="text-xs text-red-300 uppercase mb-1">O Juiz acusou:</p>
+                                 <div className="flex items-center justify-center gap-2">
+                                     <Avatar id={gameState.players[gameState.guessedPlayerId].avatarId} size="sm"/>
+                                     <span className="font-bold text-lg text-white">{gameState.players[gameState.guessedPlayerId].name}</span>
+                                 </div>
+                             </div>
+                        )}
+
+                        <div className="flex items-center justify-center gap-3 mb-4 bg-yellow-900/20 p-4 rounded-xl border border-yellow-500/30">
                             <Avatar id={gameState.players[gameState.roundWinnerId || ''].avatarId} />
-                            <span className="text-xl font-bold">{gameState.players[gameState.roundWinnerId || ''].name}</span>
+                            <div className="flex flex-col text-left">
+                                <span className="text-xs text-yellow-500 font-bold uppercase">Dono da Carta (Vencedor)</span>
+                                <span className="text-xl font-bold">{gameState.players[gameState.roundWinnerId || ''].name}</span>
+                            </div>
                         </div>
                         
                         <div className="text-sm text-gray-400 bg-gray-900/50 p-3 rounded-lg mb-4">
@@ -1598,12 +2125,18 @@ const App = () => {
                             )}
                         </div>
 
-                        {isJudge && (
-                            <Button fullWidth onClick={() => startNewRound(false)} variant="primary">
-                                Próxima Rodada <ArrowRight size={16}/>
-                            </Button>
-                        )}
-                        {!isJudge && <p className="text-xs animate-pulse">Aguardando o Juiz iniciar...</p>}
+                        {/* AUTO NEXT ROUND PROGRESS */}
+                        <div className="mt-4">
+                            <p className="text-xs text-gray-400 mb-2 animate-pulse">
+                                Próxima rodada em {resultCountdown}s...
+                            </p>
+                            <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
+                                <div 
+                                    className="bg-green-500 h-full transition-all duration-1000 ease-linear" 
+                                    style={{ width: `${(resultCountdown || 0) * 20}%` }}
+                                ></div>
+                            </div>
+                        </div>
                     </div>
                 )}
             </div>
