@@ -1342,7 +1342,7 @@ const App = () => {
 
         {/* FOOTER */}
         <div className="w-full text-center pb-2 text-gray-500 text-xs font-mono">
-             Desenvolvido por Kana Sutra - P2 - 1.0.0.0
+             Desenvolvido por Kana Sutra - P2 - 7.0.0.0
         </div>
       </div>
     );
